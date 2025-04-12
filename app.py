@@ -14,6 +14,9 @@ from linebot.v3.messaging import (
     TextMessage,
     StickerMessage,
     LocationMessage,
+    ImageMessage,
+    VideoMessage,
+    AudioMessage,
 )
 
 from linebot.v3.webhooks import (
@@ -21,14 +24,30 @@ from linebot.v3.webhooks import (
     TextMessageContent,
     StickerMessageContent,
     LocationMessageContent,
+    ImageMessageContent,  # 從 webhooks 導入
 )
 
 from modules.reply import faq, menu
     
 import os
 
-app = Flask(__name__)
+from openai import OpenAI
+from dotenv import load_dotenv
 
+running_on_render = os.getenv("RENDER") 
+print("現在是在Render上運行嗎?",running_on_render)
+
+#如果不在render上運行，則載入環境變數
+
+if not running_on_render:
+    # 載入環境變數
+    from dotenv import load_dotenv
+    load_dotenv()
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
+app = Flask(__name__)
 # Line Channel 可於 Line Developer Console 申辦
 # https://developers.line.biz/en/
 
@@ -70,22 +89,29 @@ def handle_message(event):
         print("使用者傳入的文字訊息是:", user_msg)
         # 使用TextMessage產生一段用於回應使用者的Line文字訊息
         bot_msg = TextMessage(text=f"你剛才說的是: {user_msg}, Hello!")
-        # if user_msg=="電話":
-        #     bot_msg=TextMessage(text="0911-111-111")
-        # elif user_msg=="地址":
-        #     bot_msg=TextMessage(text="台北市")
-        # elif user_msg=="營業時間":
-        #     bot_msg=TextMessage(text="上午八點到下午六點")            
-        # elif user_msg=="地理位置":
-        #     bot_msg=LocationMessage(title="我的店家",address="台北市",latitude=25.04,longitude=121.51)
 
-        # if user_msg in faq:
-        #     bot_msg = faq[user_msg]
 
         if user_msg in faq:
             bot_msg = faq[user_msg]
         elif user_msg.lower() in ["menu","選單","主選單"]: 
             bot_msg = menu
+        else:
+            #如果不是選單的問題，由opai回答
+            # TODO: 將使用者的問題由openai回答
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "user", 
+                    "content": "請用繁體中文回答"},
+
+                    {"role": "system", 
+                    "content": user_msg}
+                ]
+            )
+            bot_msg = TextMessage(text=response.choices[0].message.content)
+
+            print(response.output_text)
+
 
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
@@ -149,6 +175,92 @@ def handle_location_message(event):
             )
         )
 
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    with ApiClient(configuration) as api_client:
+        import requests
+        import base64
+        
+        line_bot_api = MessagingApi(api_client)
+        message_id = event.message.id
+        print("收到圖片，訊息ID:", message_id)
+        
+        # 使用 requests 獲取圖片內容
+        url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+        headers = {
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        }
+        response = requests.get(url, headers=headers)
+        
+        # 將圖片內容轉換為 base64 並發送給 OpenAI
+        if response.status_code == 200:
+            image_base64 = base64.b64encode(response.content).decode('utf-8')
+            
+            try:
+                # 使用 OpenAI 分析圖片
+                vision_response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "請用繁體中文描述這張圖片的內容，如果收到的圖片是食物，請根據此食物的成分，給出進行營養素分析，並且給出適當的回應"
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_base64}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=500
+                )
+                
+                # 獲取 AI 的描述並回覆
+                image_description = vision_response.choices[0].message.content
+                
+                # 回覆給使用者
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            TextMessage(text="以下是這張圖片的描述："),
+                            TextMessage(text=image_description)
+                        ]
+                    )
+                )
+            except Exception as e:
+                print("OpenAI API 錯誤:", str(e))
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            TextMessage(text="抱歉，圖片分析發生錯誤，請稍後再試。")
+                        ]
+                    )
+                )
+        
+        # 當使用者傳入圖片時
+        print("event 一個Line圖片訊息的事件物件:", event.message.id)
+        message_id = event.message.id
+        content_type = event.message.content_type
+        line_bot_api = MessagingApi(api_client)
+        # 取得圖片的資訊
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TextMessage(text=f"You just sent an image message."),
+                    TextMessage(text=f"The image message id is {event.message.id}."),
+                    TextMessage(text=f"The image message content type is {event.message.content_type}."),
+                ]
+            )
+        )
+
 # 如果應用程式被執行執行
 if __name__ == "__main__":
     print("[伺服器應用程式開始運行]")
@@ -158,5 +270,5 @@ if __name__ == "__main__":
     print(f"若在本地測試請輸入指令開啟測試通道: ./ngrok http {port} ")
     # 啟動應用程式
     # 本機測試ngrok使用127.0.0.1, debug=True
-    # Heroku Render 部署使用 0.0.0.0
+    # Render 部署使用 0.0.0.0
     app.run(host="0.0.0.0", port=port, debug=True)
